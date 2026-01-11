@@ -79,11 +79,12 @@ struct ZigData {
     u32 rawP[[hidden]];
     u32 vertsCount;
     u32 vertsOffset;
-    u32 vertsPadding = rawP -12[[export]];
-    u32 normsOffset = vertsOffset +12[[export]];
-    u32 normsPadding = rawP -6[[export]];
-    u32 uvOffset = vertsOffset +24[[export]];
-    u32 uvPadding = rawP -4[[export]];
+
+    u32 vertsPadding = rawP - 12 [[export]];
+    u32 normsOffset = vertsOffset + 12 [[export]];
+    u32 normsPadding = rawP - 6 [[export]];
+    u32 uvOffset = vertsOffset + 24 [[export]];
+    u32 uvPadding = rawP - 4 [[export]];
 };
 
 fn isZigData() {
@@ -91,7 +92,7 @@ fn isZigData() {
     for (u8 i = 0, i < 20, i += 1) {
         $ += 2;
         u48 test @ $;
-        if (test == 281474976645120) {
+        if (test == 281474976645120) { // 0x0001000000000000
             return $;
         }
         $ += 14;
@@ -146,10 +147,6 @@ fn print2(auto prefix, auto str2, u32 maxLen) {
 };
 
 /*
-    Returns 1 if str2 == "SteeringWheel\0" (exact match, including terminator),
-    assuming DBENameLen includes the terminator (as getStrLen does).
-*/
-/*
     Returns 1 if the name contains the substring "SteeringWheel".
     Performs a bounded substring search within maxLen.
 */
@@ -180,18 +177,45 @@ fn containsSteeringWheel(auto str2, u32 maxLen) {
 };
 
 /*
-    Minimal DBEOffsetPtr header:
-    +0x0C NamePtrRel
-    +0x14 DataPtrRel
-*/
-struct DBEHeader {
-    u32 w0 [[hidden]];
-    u32 w1 [[hidden]];
-    u32 w2 [[hidden]];
+    SuBranch (SSR Wii) – serialized scene node header
 
-    u32 NamePtrRel [[export]];
-    u32 w4 [[hidden]];
-    u32 DataPtrRel [[export]];
+    Matches struct SuBranch from SSR_Wii.c:
+      u16 parent, child, sibling, flags
+      u32 hash
+      char* name
+      SuBlindData* blind
+
+    In SiFF, pointers are stored as relative offsets.
+    Some builds store an extra pointer immediately after SuBranch
+    at +0x14, used here as RenderPtrRel.
+*/
+struct SuBranchHeader {
+    u16 ParentIdx     [[export]];
+    u16 ChildIdx      [[export]];
+    u16 SiblingIdx    [[export]];
+    u16 BranchFlags   [[export]];
+
+    u32 HashValue     [[export]];
+    u32 NamePtrRel    [[export]];
+    u32 BlindPtrRel   [[export]];
+
+    // Observed extra pointer at +0x14 (immediately after SuBranch)
+    u32 RenderPtrRel  [[export]];
+};
+
+struct SuBlindElement {
+    u32 InstanceHash [[export]];
+    u32 TypeHash     [[export]];
+    u32 DataPtrRel   [[export]];
+};
+
+struct SuBlindData<auto Offset, auto FileSize> {
+    u32 ElementQty [[export]];
+
+    const u32 ElementCap = 8;
+    u32 SafeQty = (ElementQty < ElementCap) ? ElementQty : ElementCap;
+
+    SuBlindElement Elements[SafeQty] [[export]];
 };
 
 /*
@@ -199,6 +223,8 @@ struct DBEHeader {
     Jump to offsets without big padding arrays.
 */
 struct MeshDescProbe<auto Offset> {
+    // This probe reads the engine render-mesh descriptor block.
+    // It is only valid when called on the correct RenderPtrRel base.
     u32 ProbeBase = $ [[export]];
 
     $ = ProbeBase + 0xCC;
@@ -219,6 +245,141 @@ struct MeshDescProbe<auto Offset> {
     $ = ProbeBase + 0x100;
 };
 
+/*
+    Tree walker (correct behaviour):
+    - SteeringWheel can be a grouping node.
+    - The mesh often lives on a descendant branch.
+
+    This function walks Child/Sibling links starting from RootIdx,
+    prints each visited node, and probes RenderPtrRel and BlindData
+    for plausible render-mesh descriptors.
+
+    Hard-bounded to avoid ImHex hangs.
+*/
+fn walkBranchTree(auto Offset, u32 FileSize, u32 DBEntryPtrRel, u32 RootIdx) {
+    const u32 MaxNodes = 64;
+
+    u32 stack[MaxNodes];
+    u32 sp = 0;
+
+    u32 visited[MaxNodes];
+    u32 visitedN = 0;
+
+    // push root
+    stack[0] = RootIdx;
+    sp = 1;
+
+    std::print("\n=== BranchTreeWalk (RootIdx: {}) ===\n", RootIdx);
+
+    for (u32 iter = 0, iter < MaxNodes, iter += 1) {
+        if (sp == 0) {
+            break;
+        }
+
+        sp -= 1;
+        u32 idx = stack[sp];
+
+        // seen check
+        u32 seen = 0;
+        for (u32 vi = 0, vi < visitedN, vi += 1) {
+            if (visited[vi] == idx) {
+                seen = 1;
+                break;
+            }
+        }
+        if (seen == 1) {
+            continue;
+        }
+        visited[visitedN] = idx;
+        visitedN += 1;
+
+        // read DBEOffsetPtrRel from branch pointer table (m_ppBranches)
+        // Pointers are typically relative to ForestFile base (Offset), but some builds may already be absolute.
+        u32 DBEOffsetPtrRel;
+
+        // primary interpretation: table is relative -> absolute = DBEntryPtrRel + Offset
+        $ = DBEntryPtrRel + Offset + idx * 4;
+        u32 offA;
+
+        // fallback interpretation: table is already absolute (no additional Offset)
+        u32 offB = 0;
+        if (offA == 0) {
+            if (DBEntryPtrRel >= Offset && DBEntryPtrRel < Offset + FileSize) {
+                $ = DBEntryPtrRel + idx * 4;
+                u32 offB_read;
+                offB = offB_read;
+            }
+        }
+
+        DBEOffsetPtrRel = (offA != 0) ? offA : offB;
+
+        if (DBEOffsetPtrRel == 0 || DBEOffsetPtrRel >= FileSize) {
+            std::print("Node[{}]: invalid DBEOffsetPtrRel {} (offA={}, offB={})\\n", idx, DBEOffsetPtrRel, offA, offB);
+            continue;
+        }
+
+        u32 DBEOffsetAbs = DBEOffsetPtrRel + Offset;
+        $ = DBEOffsetAbs;
+        SuBranchHeader BH;
+
+        // name (bounded)
+        std::print("Node[{}] P:{} C:{} S:{} Flags:{} Hash:{}\n",
+            idx, BH.ParentIdx, BH.ChildIdx, BH.SiblingIdx, BH.BranchFlags, BH.HashValue);
+        std::print("  BlindPtrRel:{} RenderPtrRel:{}\n", BH.BlindPtrRel, BH.RenderPtrRel);
+
+        if (BH.NamePtrRel != 0 && BH.NamePtrRel < FileSize) {
+            $ = BH.NamePtrRel + Offset;
+            u8 nlen = getStrLen();
+            char nm[nlen];
+            print2("  Name: ", nm, nlen);
+            std::print("\n");
+        } else {
+            std::print("  Name: <invalid ptr>\n");
+        }
+
+        // Probe RenderPtrRel as mesh descriptor
+        if (BH.RenderPtrRel != 0 && (BH.RenderPtrRel % 16) == 0 && BH.RenderPtrRel < FileSize) {
+            $ = BH.RenderPtrRel + Offset;
+            MeshDescProbe<Offset> MP;
+
+            std::print("  [RenderPtr] facesCount:{} vertsCount:{}\n", MP.facesCount, MP.vertsCount);
+            std::print("  [RenderPtr] facesOffsetAbs:{} vertsOffsetAbs:{}\n", MP.facesOffsetAbs, MP.vertsOffsetAbs);
+        }
+
+        // Probe BlindData elements (limited)
+        if (BH.BlindPtrRel != 0 && (BH.BlindPtrRel % 4) == 0 && BH.BlindPtrRel < FileSize) {
+            $ = BH.BlindPtrRel + Offset;
+            SuBlindData<Offset, FileSize> BD;
+
+            std::print("  [BlindData] ElementQty:{} (showing up to 8)\n", BD.ElementQty);
+
+            for (u32 ei = 0, ei < BD.SafeQty, ei += 1) {
+                std::print("    Elem[{}] instHash:{} typeHash:{} dataRel:{}\n",
+                    ei, BD.Elements[ei].InstanceHash, BD.Elements[ei].TypeHash, BD.Elements[ei].DataPtrRel);
+
+                // Optional: probe element data pointer as mesh descriptor
+                if (BD.Elements[ei].DataPtrRel != 0 && (BD.Elements[ei].DataPtrRel % 16) == 0 && BD.Elements[ei].DataPtrRel < FileSize) {
+                    $ = BD.Elements[ei].DataPtrRel + Offset;
+                    MeshDescProbe<Offset> MP2;
+                    std::print("      [ElemData] facesCount:{} vertsCount:{}\n", MP2.facesCount, MP2.vertsCount);
+                }
+            }
+        }
+
+        // push child then sibling (DFS), respecting 0xFFFF sentinel
+        if (BH.SiblingIdx != 0xFFFF && sp < MaxNodes) {
+            stack[sp] = BH.SiblingIdx;
+            sp += 1;
+        }
+        if (BH.ChildIdx != 0xFFFF && sp < MaxNodes) {
+            stack[sp] = BH.ChildIdx;
+            sp += 1;
+        }
+    }
+
+    std::print("=== BranchTreeWalk END (visited {}) ===\n", visitedN);
+};
+
 struct DBEntry<auto Offset> {
     u32 start = $;
 
@@ -227,7 +388,7 @@ struct DBEntry<auto Offset> {
 
     // header at DBEOffsetPtr
     $ = DBEOffsetAbs;
-    DBEHeader Hdr [[export]];
+    SuBranchHeader Hdr [[export]];
 
     // Name ptr + string
     u32 DBENamePtr = Hdr.NamePtrRel [[export]];
@@ -242,24 +403,40 @@ struct DBEntry<auto Offset> {
         std::print("\n=== DEBUG: SteeringWheel ===\n");
         std::print("DBEOffsetPtrRel: {}\n", DBEOffsetPtr);
         std::print("DBEOffsetAbs:    {}\n", DBEOffsetAbs);
+
         std::print("NamePtrRel:      {}\n", Hdr.NamePtrRel);
         std::print("NamePtrAbs:      {}\n", Hdr.NamePtrRel + Offset);
-        std::print("DataPtrRel:      {}\n", Hdr.DataPtrRel);
-        std::print("DataPtrAbs:      {}\n", Hdr.DataPtrRel + Offset);
+
+        std::print("BlindPtrRel:     {}\n", Hdr.BlindPtrRel);
+        std::print("BlindPtrAbs:     {}\n", Hdr.BlindPtrRel + Offset);
+
+        std::print("RenderPtrRel:    {}\n", Hdr.RenderPtrRel);
+        std::print("RenderPtrAbs:    {}\n", Hdr.RenderPtrRel + Offset);
+
+        std::print("ParentIdx:       {}\n", Hdr.ParentIdx);
+        std::print("ChildIdx:        {}\n", Hdr.ChildIdx);
+        std::print("SiblingIdx:      {}\n", Hdr.SiblingIdx);
+        std::print("BranchFlags:     {}\n", Hdr.BranchFlags);
+        std::print("HashValue:       {}\n", Hdr.HashValue);
+
+        // legacy labels preserved (your logs referenced them)
+        std::print("DataPtrRel:      {}\n", Hdr.RenderPtrRel);
+        std::print("DataPtrAbs:      {}\n", Hdr.RenderPtrRel + Offset);
+
         std::print("NameLen(raw):    {}\n", DBENameLen);
         print2("Name:            ", DBEName, DBENameLen);
         std::print("\n");
     }
 
-    // ZigData test pointer (your original)
-    $ = DBEOffsetPtr + 20 + Offset;
-    u32 DBETestDataPtr[[hidden]];
+    // Render pointer (immediately after SuBranch). Often NULL for grouping/instance nodes.
+    u32 DBETestDataPtr = Hdr.RenderPtrRel [[hidden]];
 
     if (DebugSteeringWheel == 1) {
         std::print("DBETestDataPtrRel(read@DBEOffset+0x14): {}\n", DBETestDataPtr);
         std::print("DBETestDataPtrAbs:                      {}\n", DBETestDataPtr + Offset);
     }
 
+    // Optional: ZigData signature probe at RenderPtrRel (works only if RenderPtrRel points at/near ZigData)
     if (DBETestDataPtr % 16 == 0) {
         $ = DBETestDataPtr + Offset;
 
@@ -270,9 +447,7 @@ struct DBEntry<auto Offset> {
         }
 
         if (TestOffset != 0) {
-            $ = DBEOffsetPtr + 20 + Offset;
-            u32 DBEDataPtr;
-            u32 ZigDataPos = TestOffset[[export]];
+            u32 ZigDataPos = TestOffset [[export]];
 
             if (DebugSteeringWheel == 1) {
                 std::print("ZigDataPosRel: {}\n", ZigDataPos);
@@ -298,7 +473,6 @@ struct DBEntry<auto Offset> {
                 std::print("uvOffsetAbs: {}\n", DBEData.uvOffset + Offset);
                 std::print("==========================\n");
             }
-
         } else {
             print2("Failed:", DBEName, DBENameLen);
 
@@ -309,8 +483,6 @@ struct DBEntry<auto Offset> {
             }
         }
     } else {
-        // if you want visibility even when misaligned:
-        // print2("Failed:", DBEName, DBENameLen);
         if (DebugSteeringWheel == 1) {
             std::print("\n--- ZigData SKIP (SteeringWheel) ---\n");
             std::print("DBETestDataPtrRel not 16-aligned.\n");
@@ -318,9 +490,9 @@ struct DBEntry<auto Offset> {
         }
     }
 
-    // Optional: probe DataPtrRel safely
-    if (Hdr.DataPtrRel != 0 && (Hdr.DataPtrRel % 16) == 0) {
-        $ = Hdr.DataPtrRel + Offset;
+    // Probe RenderPtrRel safely as mesh descriptor
+    if (Hdr.RenderPtrRel != 0 && (Hdr.RenderPtrRel % 16) == 0) {
+        $ = Hdr.RenderPtrRel + Offset;
         MeshDescProbe<Offset> MeshProbe [[export]];
 
         if (DebugSteeringWheel == 1) {
@@ -339,7 +511,7 @@ struct DBEntry<auto Offset> {
     } else {
         if (DebugSteeringWheel == 1) {
             std::print("\n--- MeshDescProbe SKIP (SteeringWheel) ---\n");
-            std::print("Hdr.DataPtrRel is 0 or not 16-aligned.\n");
+            std::print("Hdr.RenderPtrRel is 0 or not 16-aligned.\n");
             std::print("=====================================\n");
         }
     }
@@ -347,11 +519,54 @@ struct DBEntry<auto Offset> {
     $ = start + 4;
 };
 
+/*
+    SIF ("SiFF") research notes – DBEntryPtr descriptor table
+
+    Cross-checks against multiple ForestFiles show DBEntryPtr
+    targets a multi-purpose scene descriptor, not raw data.
+
+    Observed invariant properties:
+    - Section A offsets always point to valid branch headers
+    - Section B count matches number of instance-like nodes
+    - Section C count is constant (usually 3), implying fixed scene layers
+*/
 struct DataBranch<auto Offset> {
     u32 DBSize;
     u32 DBEntryPtr;
+
+    /*
+        CRITICAL SAFETY NOTE (ImHex memory explosion fix):
+        hard-cap the number of DBEntries parsed.
+    */
+    const u32 DBSizeCap = 5;
+    u32 SafeDBSize = (DBSize < DBSizeCap) ? DBSize : DBSizeCap;
+
+    // Jump into entry-offset list
     $ = DBEntryPtr + Offset;
-    DBEntry<Offset> DBEntries[DBSize];
+
+    DBEntry<Offset> DBEntries[SafeDBSize];
+
+    // Identify SteeringWheel within the materialized window
+    // (ImHex does not allow for-loops as struct members; unrolled checks)
+    u32 SteeringWheelFound = 0 [[export]];
+    u32 SteeringWheelIndex = 0xFFFFFFFF [[export]];
+
+    if (SafeDBSize > 0 && DBEntries[0].DebugSteeringWheel == 1) {
+        SteeringWheelFound = 1;
+        SteeringWheelIndex = 0;
+    } else if (SafeDBSize > 1 && DBEntries[1].DebugSteeringWheel == 1) {
+        SteeringWheelFound = 1;
+        SteeringWheelIndex = 1;
+    } else if (SafeDBSize > 2 && DBEntries[2].DebugSteeringWheel == 1) {
+        SteeringWheelFound = 1;
+        SteeringWheelIndex = 2;
+    } else if (SafeDBSize > 3 && DBEntries[3].DebugSteeringWheel == 1) {
+        SteeringWheelFound = 1;
+        SteeringWheelIndex = 3;
+    } else if (SafeDBSize > 4 && DBEntries[4].DebugSteeringWheel == 1) {
+        SteeringWheelFound = 1;
+        SteeringWheelIndex = 4;
+    }
 };
 
 struct TBEntry<auto Offset> {
@@ -385,7 +600,7 @@ struct ForestHeader<auto Offset> {
     $ += 12;
     u32 DBPtr;
 
-    $ = 40 + NCount * 4 -4 + Offset;
+    $ = 40 + NCount * 4 - 4 + Offset;
 };
 
 struct ForestFile {
@@ -400,6 +615,12 @@ struct ForestFile {
 
     $ = Header.DBPtr + 8 + Offset;
     DataBranch<Offset> DB;
+
+    // Correct behaviour: SteeringWheel may be a grouping branch.
+    // Walk descendants to locate actual renderable mesh owners.
+    if (DB.SteeringWheelFound == 1) {
+        walkBranchTree(Offset, FileSize, DB.DBEntryPtr, DB.SteeringWheelIndex);
+    }
 
     $ = FileEOff - 4;
     u32 FileEnd;
