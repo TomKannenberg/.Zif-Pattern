@@ -1,6 +1,35 @@
 #include <std/sys.pat>
 #include <std/file.pat>
 
+/*
+==============================
+TODO: SteeringWheel Mesh Layout
+==============================
+Based on observed tooling expectations (Vertices / Faces panel):
+
+Vertices:
+- Offset            : TODO (absolute + relative)
+- Padding           : TODO
+- Padding Interval  : TODO
+
+Faces:
+- Offset            : TODO (absolute + relative)
+- Padding           : TODO
+- Padding Interval  : TODO
+
+Additional (if present):
+- Normals Offset
+- UV Offset
+- Stride / rawP
+
+Scope:
+- Asset: SteeringWheel
+- Location: ForestIndexes[0] -> DBEntries[4]
+- Only offsets derived from this DBEntry are valid.
+- No global assumptions.
+==============================
+*/
+
 struct bareIndex {
     $ += 8;
     u32 ForestPtr;
@@ -8,12 +37,11 @@ struct bareIndex {
 };
 
 struct bareHeader {
-    u32 fileSize;
-    $ += 24;
-    u32 FirstNamePtr;
-    $ -= 12;
-    u32 FileCount;
-    bareIndex index[FileCount];
+    u32 fileSize     @ 0x00;
+    u32 FileCount    @ 0x14;
+    u32 FirstNamePtr @ 0x1C;
+
+    bareIndex index[FileCount] @ 0x18;
 };
 
 bareHeader infoHeader @ 0x0[[hidden]];
@@ -37,7 +65,7 @@ fn getStrLen() {
         i += 1;
         u8 atpos @ $;
         if (atpos == 00) {
-            return i;
+            return i; // includes the terminator byte in the count
         }
     }
     return 32;
@@ -75,63 +103,259 @@ fn printn(auto num) {
     std::print("{}", num);
 };
 
-fn print2(auto str1, auto str2) {
-    std::print(str1);
-    std::print(str2);
+/*
+    SAFE print2:
+    - MUST be called with the maximum valid length of str2 (array length).
+    - Never reads beyond that length.
+    - Sanitizes to printable ASCII.
+*/
+fn print2(auto prefix, auto str2, u32 maxLen) {
+    u32 cap = maxLen;
+
+    if (cap > 256) {
+        cap = 256;
+    }
+
+    u32 len = 0;
+
+    // pass 1: bounded length scan
+    for (u32 i = 0, i < cap, i += 1) {
+        if (str2[i] == 0x00) {
+            break;
+        }
+        len += 1;
+    }
+
+    // always allocate at least 1 char (+ terminator)
+    char safe[len + 1];
+
+    // pass 2: sanitize + copy
+    for (u32 i = 0, i < len, i += 1) {
+        u8 c = str2[i];
+        if (c >= 0x20 && c <= 0x7E) {
+            safe[i] = str2[i];
+        } else {
+            safe[i] = '.';
+        }
+    }
+
+    // terminator
+    safe[len] = 0x00;
+
+    std::print("{}{}", prefix, safe);
+};
+
+/*
+    Returns 1 if str2 == "SteeringWheel\0" (exact match, including terminator),
+    assuming DBENameLen includes the terminator (as getStrLen does).
+*/
+/*
+    Returns 1 if the name contains the substring "SteeringWheel".
+    Performs a bounded substring search within maxLen.
+*/
+fn containsSteeringWheel(auto str2, u32 maxLen) {
+    // "SteeringWheel" length = 13
+    if (maxLen < 13) {
+        return 0;
+    }
+
+    for (u32 i = 0, i + 13 <= maxLen, i += 1) {
+        if (str2[i + 0]  != 'S') continue;
+        if (str2[i + 1]  != 't') continue;
+        if (str2[i + 2]  != 'e') continue;
+        if (str2[i + 3]  != 'e') continue;
+        if (str2[i + 4]  != 'r') continue;
+        if (str2[i + 5]  != 'i') continue;
+        if (str2[i + 6]  != 'n') continue;
+        if (str2[i + 7]  != 'g') continue;
+        if (str2[i + 8]  != 'W') continue;
+        if (str2[i + 9]  != 'h') continue;
+        if (str2[i + 10] != 'e') continue;
+        if (str2[i + 11] != 'e') continue;
+        if (str2[i + 12] != 'l') continue;
+        return 1;
+    }
+
+    return 0;
+};
+
+/*
+    Minimal DBEOffsetPtr header:
+    +0x0C NamePtrRel
+    +0x14 DataPtrRel
+*/
+struct DBEHeader {
+    u32 w0 [[hidden]];
+    u32 w1 [[hidden]];
+    u32 w2 [[hidden]];
+
+    u32 NamePtrRel [[export]];
+    u32 w4 [[hidden]];
+    u32 DataPtrRel [[export]];
+};
+
+/*
+    SAFE Mesh descriptor probe:
+    Jump to offsets without big padding arrays.
+*/
+struct MeshDescProbe<auto Offset> {
+    u32 ProbeBase = $ [[export]];
+
+    $ = ProbeBase + 0xCC;
+    u32 facesCount [[export]];
+    u32 facesOffsetRel [[export]];
+    u32 unkD4 [[hidden]];
+
+    $ = ProbeBase + 0xF4;
+    u32 rawP_stride [[export]];
+    u32 vertsCount [[export]];
+    u32 vertsOffsetRel [[export]];
+
+    u32 vertsPaddingAfterXYZ = rawP_stride - 12 [[export]];
+    u32 facesOffsetAbs = facesOffsetRel + Offset [[export]];
+    u32 vertsOffsetAbs = vertsOffsetRel + Offset [[export]];
+
+    // keep cursor sane
+    $ = ProbeBase + 0x100;
 };
 
 struct DBEntry<auto Offset> {
-    u32 start = $;                      // to go back later
+    u32 start = $;
 
-    u32 DBEOffsetPtr;
-   
-    $ = DBEOffsetPtr + 12 + Offset;
-    u32 DBENamePtr;
+    u32 DBEOffsetPtr [[export]];
+    u32 DBEOffsetAbs = DBEOffsetPtr + Offset [[export]];
 
-        $ =  DBENamePtr + Offset; 
-        u8   DBENameLen = getStrLen();  // returns when null terminator is found or 32 is reached
+    // header at DBEOffsetPtr
+    $ = DBEOffsetAbs;
+    DBEHeader Hdr [[export]];
 
-        char DBEName[DBENameLen];       // string with calculated size
+    // Name ptr + string
+    u32 DBENamePtr = Hdr.NamePtrRel [[export]];
 
+    $ = DBENamePtr + Offset;
+    u8   DBENameLen = getStrLen();
+    char DBEName[DBENameLen];
 
+    u32 DebugSteeringWheel = containsSteeringWheel(DBEName, DBENameLen) [[export]];
+
+    if (DebugSteeringWheel == 1) {
+        std::print("\n=== DEBUG: SteeringWheel ===\n");
+        std::print("DBEOffsetPtrRel: {}\n", DBEOffsetPtr);
+        std::print("DBEOffsetAbs:    {}\n", DBEOffsetAbs);
+        std::print("NamePtrRel:      {}\n", Hdr.NamePtrRel);
+        std::print("NamePtrAbs:      {}\n", Hdr.NamePtrRel + Offset);
+        std::print("DataPtrRel:      {}\n", Hdr.DataPtrRel);
+        std::print("DataPtrAbs:      {}\n", Hdr.DataPtrRel + Offset);
+        std::print("NameLen(raw):    {}\n", DBENameLen);
+        print2("Name:            ", DBEName, DBENameLen);
+        std::print("\n");
+    }
+
+    // ZigData test pointer (your original)
     $ = DBEOffsetPtr + 20 + Offset;
     u32 DBETestDataPtr[[hidden]];
-    
-    
+
+    if (DebugSteeringWheel == 1) {
+        std::print("DBETestDataPtrRel(read@DBEOffset+0x14): {}\n", DBETestDataPtr);
+        std::print("DBETestDataPtrAbs:                      {}\n", DBETestDataPtr + Offset);
+    }
+
     if (DBETestDataPtr % 16 == 0) {
         $ = DBETestDataPtr + Offset;
-        
+
         u32 TestOffset = isZigData();
-        
+
+        if (DebugSteeringWheel == 1) {
+            std::print("isZigData() returned (cursor): {}\n", TestOffset);
+        }
+
         if (TestOffset != 0) {
             $ = DBEOffsetPtr + 20 + Offset;
             u32 DBEDataPtr;
             u32 ZigDataPos = TestOffset[[export]];
-            
+
+            if (DebugSteeringWheel == 1) {
+                std::print("ZigDataPosRel: {}\n", ZigDataPos);
+                std::print("ZigDataPosAbs: {}\n", ZigDataPos + Offset);
+            }
+
             $ = ZigDataPos + Offset;
             ZigData DBEData;
-            print2("Succeeded:", DBEName);
+
+            print2("Succeeded:", DBEName, DBENameLen);
+
+            if (DebugSteeringWheel == 1) {
+                std::print("\n--- ZigData (SteeringWheel) ---\n");
+                std::print("facesCount: {}\n", DBEData.facesCount);
+                std::print("facesOffsetRel: {}\n", DBEData.facesOffset);
+                std::print("facesOffsetAbs: {}\n", DBEData.facesOffset + Offset);
+                std::print("vertsCount: {}\n", DBEData.vertsCount);
+                std::print("vertsOffsetRel: {}\n", DBEData.vertsOffset);
+                std::print("vertsOffsetAbs: {}\n", DBEData.vertsOffset + Offset);
+                std::print("rawP/stride: (hidden field in ZigData)\n");
+                std::print("vertsPadding: {}\n", DBEData.vertsPadding);
+                std::print("normsOffsetAbs: {}\n", DBEData.normsOffset + Offset);
+                std::print("uvOffsetAbs: {}\n", DBEData.uvOffset + Offset);
+                std::print("==========================\n");
+            }
+
         } else {
-            print2("Failed:", DBEName);
+            print2("Failed:", DBEName, DBENameLen);
+
+            if (DebugSteeringWheel == 1) {
+                std::print("\n--- ZigData FAIL (SteeringWheel) ---\n");
+                std::print("No ZigData signature detected at DBETestDataPtrAbs.\n");
+                std::print("===============================\n");
+            }
         }
-        
+    } else {
+        // if you want visibility even when misaligned:
+        // print2("Failed:", DBEName, DBENameLen);
+        if (DebugSteeringWheel == 1) {
+            std::print("\n--- ZigData SKIP (SteeringWheel) ---\n");
+            std::print("DBETestDataPtrRel not 16-aligned.\n");
+            std::print("===============================\n");
+        }
     }
 
+    // Optional: probe DataPtrRel safely
+    if (Hdr.DataPtrRel != 0 && (Hdr.DataPtrRel % 16) == 0) {
+        $ = Hdr.DataPtrRel + Offset;
+        MeshDescProbe<Offset> MeshProbe [[export]];
 
-    $ = start + 4;                      // later is now, +8 is after NameOffsetPTR and DataOffsetPtr
+        if (DebugSteeringWheel == 1) {
+            std::print("\n--- MeshDescProbe (SteeringWheel) ---\n");
+            std::print("ProbeBaseAbs: {}\n", MeshProbe.ProbeBase);
+            std::print("facesCount: {}\n", MeshProbe.facesCount);
+            std::print("facesOffsetRel: {}\n", MeshProbe.facesOffsetRel);
+            std::print("facesOffsetAbs: {}\n", MeshProbe.facesOffsetAbs);
+            std::print("rawP_stride: {}\n", MeshProbe.rawP_stride);
+            std::print("vertsCount: {}\n", MeshProbe.vertsCount);
+            std::print("vertsOffsetRel: {}\n", MeshProbe.vertsOffsetRel);
+            std::print("vertsOffsetAbs: {}\n", MeshProbe.vertsOffsetAbs);
+            std::print("vertsPaddingAfterXYZ: {}\n", MeshProbe.vertsPaddingAfterXYZ);
+            std::print("===============================\n");
+        }
+    } else {
+        if (DebugSteeringWheel == 1) {
+            std::print("\n--- MeshDescProbe SKIP (SteeringWheel) ---\n");
+            std::print("Hdr.DataPtrRel is 0 or not 16-aligned.\n");
+            std::print("=====================================\n");
+        }
+    }
+
+    $ = start + 4;
 };
-                    
+
 struct DataBranch<auto Offset> {
-    
     u32 DBSize;
     u32 DBEntryPtr;
     $ = DBEntryPtr + Offset;
     DBEntry<Offset> DBEntries[DBSize];
-    
 };
 
 struct TBEntry<auto Offset> {
-    u32 start = $;                      // to go back later
+    u32 start = $;
 
     u32 TBENameOffsetPtr;
 
@@ -140,16 +364,14 @@ struct TBEntry<auto Offset> {
     $ += 4;
     u32 TBEZigOffset;
 
-        $ =  TBENamePtr + Offset;
-        u8   TBENameLen = getStrLen();
-
-        char TBEName[TBENameLen];
+    $ =  TBENamePtr + Offset;
+    u8   TBENameLen = getStrLen();
+    char TBEName[TBENameLen];
 
     $ = start + 4;
 };
 
 struct TexBranch<auto size, auto Offset> {
-    
     u32 TBSize = size;
     TBEntry<Offset> TBEntries[TBSize];
 };
@@ -157,26 +379,23 @@ struct TexBranch<auto size, auto Offset> {
 struct ForestHeader<auto Offset> {
     u32 NCount;
     $ += 4;
-    u32 TBSize;                         // amount of textures
+    u32 TBSize;
     $ += 8;
-    u32;                                // points to after textures
+    u32;
     $ += 12;
     u32 DBPtr;
 
-    $ = 40 + NCount * 4 -4 + Offset;    // 40 = DB + 4, NCount nullptrs -1
-    
+    $ = 40 + NCount * 4 -4 + Offset;
 };
 
 struct ForestFile {
-    // Size stuff can't be used outside of .zif
     u32 FileSize = getAssetSize();
-    $ = $ + 20; // 16 bytes null, 4 bytes size
+    $ = $ + 20;
     u32 FileEOff = $ + FileSize;
 
     u32 Offset = $;
 
     ForestHeader<Offset> Header;
-
     TexBranch<Header.TBSize, Offset> TB;
 
     $ = Header.DBPtr + 8 + Offset;
@@ -184,33 +403,30 @@ struct ForestFile {
 
     $ = FileEOff - 4;
     u32 FileEnd;
-
 };
 
 struct ForestIndex {
     $ += 4;
     u32 FileNamePtr;
-    
-        u32 start = $;
-        $ = FileNamePtr + 16 + 4;
-        u32 NameLen = getStrLen();
-        char FileName[NameLen];
-        $ = start;
-    
-    
+
+    u32 start = $;
+    $ = FileNamePtr + 16 + 4;
+    u32 NameLen = getStrLen();
+    char FileName[NameLen];
+    $ = start;
+
     u32 ForestPtr;
-    
-        start = $;
-        $ = ForestPtr;
-        ForestFile File;
-        $ = start;
-        
+
+    start = $;
+    $ = ForestPtr;
+    ForestFile File;
+    $ = start;
+
     u32 ForestZigOffset;
-    
-        $ = start + 4;
+    $ = start + 4;
 };
 
-struct ZifHeader {    
+struct ZifHeader {
     $ += 16;
     u32 FileCount;
 };
