@@ -30,33 +30,85 @@ Scope:
 ==============================
 */
 
-struct bareIndex {
-    $ += 8;
-    u32 ForestPtr;
-    $ += 4;
+/*
+    SiFF container layout (as used by the developers / runtime loader)
+
+    In SSR_Wii.c, SiFF files are chunked. A ChunkHeader is:
+        u32 id;
+        u32 chunk_size;
+        u32 data_size;
+        u32 endian_indicator;
+
+    In this particular .sif, there is an additional u32 before the first ChunkHeader
+    which equals (total_file_size - 4). The first ChunkHeader begins at 0x04.
+
+    Observed in BillyHatcher.sif:
+      0x00: FileSizeMinus4
+      0x04: ChunkHeader id = 'FORE'
+      0x14: FORE payload begins (FileCount + ForestIndexEntry[])
+*/
+
+struct ChunkHeader {
+    u32 id [[export]];              // e.g. 'FORE'
+    u32 chunk_size [[export]];
+    u32 data_size [[export]];
+    u32 endian_indicator [[export]]; // typically 0x44332211 in this build
 };
 
-struct bareHeader {
-    u32 fileSize     @ 0x00;
-    u32 FileCount    @ 0x14;
-    u32 FirstNamePtr @ 0x1C;
-
-    bareIndex index[FileCount] @ 0x18;
+struct ForestIndexEntry {
+    u32 ForestHash [[export]];
+    u32 FileNamePtr [[export]];     // absolute file offset into concatenated name blob
+    u32 ForestPtr [[export]];       // absolute file offset to ForestFile preamble
+    u32 ForestZigOffset [[export]];
 };
 
-bareHeader infoHeader @ 0x0[[hidden]];
+struct SiffPreamble {
+    u32 FileSizeMinus4 [[export]];
+    ChunkHeader FirstChunk [[export]];
+};
 
+// Minimal, safe globals used only for sizing logic
+SiffPreamble gSiff @ 0x00 [[hidden]];
+
+struct ForeIndexTable {
+    u32 FileCount;
+
+    const u32 FileCountCap = 64;
+    u32 SafeFileCount = (FileCount < FileCountCap) ? FileCount : FileCountCap;
+
+    ForestIndexEntry Index[SafeFileCount];
+};
+
+// FORE payload starts immediately after the first ChunkHeader (0x04 + 0x10 = 0x14)
+ForeIndexTable gFore @ 0x14 [[hidden]];
+
+fn getTotalFileSize() {
+    return gSiff.FileSizeMinus4 + 4;
+};
+
+// Compute ForestFile size by looking at the next ForestPtr in the FORE index table.
 fn getAssetSize() {
-    for (u32 i = 1, i < infoHeader.FileCount, i = i + 1) {
-        if ($ == infoHeader.index[i - 1].ForestPtr) {
-            return infoHeader.index[i].ForestPtr - infoHeader.index[i - 1].ForestPtr;
+    u32 curForestPtr = $;
+
+    for (u32 i = 0, i < gFore.SafeFileCount, i += 1) {
+        if (curForestPtr == gFore.Index[i].ForestPtr) {
+            if (i + 1 < gFore.SafeFileCount) {
+                u32 nextPtr = gFore.Index[i + 1].ForestPtr;
+                if (nextPtr > curForestPtr) {
+                    return nextPtr - curForestPtr;
+                }
+                break;
+            }
+
+            u32 total = getTotalFileSize();
+            if (total > curForestPtr) {
+                return total - curForestPtr;
+            }
+            break;
         }
     }
-    if (infoHeader.FileCount) {
-        return infoHeader.FirstNamePtr - infoHeader.index[infoHeader.FileCount - 1].ForestPtr;
-    } else {
-        return 0;
-    }
+
+    return 0;
 };
 
 fn getStrLen() {
@@ -314,7 +366,7 @@ fn walkBranchTree(auto Offset, u32 FileSize, u32 DBEntryPtrRel, u32 RootIdx) {
         DBEOffsetPtrRel = (offA != 0) ? offA : offB;
 
         if (DBEOffsetPtrRel == 0 || DBEOffsetPtrRel >= FileSize) {
-            std::print("Node[{}]: invalid DBEOffsetPtrRel {} (offA={}, offB={})\\n", idx, DBEOffsetPtrRel, offA, offB);
+            std::print("Node[{}]: invalid DBEOffsetPtrRel {} (offA={}, offB={})\n", idx, DBEOffsetPtrRel, offA, offB);
             continue;
         }
 
@@ -627,34 +679,47 @@ struct ForestFile {
 };
 
 struct ForestIndex {
-    $ += 4;
-    u32 FileNamePtr;
+    // Exact 16-byte index entry as stored in the FORE payload
+    u32 ForestHash [[export]];
+    u32 FileNamePtr [[export]];
+    u32 ForestPtr [[export]];
+    u32 ForestZigOffset [[export]];
 
-    u32 start = $;
-    $ = FileNamePtr + 16 + 4;
-    u32 NameLen = getStrLen();
-    char FileName[NameLen];
-    $ = start;
+    // Resolve filename from the concatenated name blob.
+    // The first name is preceded by 20 bytes of zeros; subsequent names are contiguous.
+    u32 _ret_after_entry = $ [[hidden]];
 
-    u32 ForestPtr;
+    $ = FileNamePtr;
+    u32 z0; u32 z1; u32 z2; u32 z3; u32 z4;
 
-    start = $;
+    // NOTE: Avoid assignment statements inside structs (would attempt to write to the file).
+    // Compute NameAbs as a local/calculated value via initializer.
+    u32 NameAbs = ((z0 == 0 && z1 == 0 && z2 == 0 && z3 == 0 && z4 == 0) ? (FileNamePtr + 20) : FileNamePtr) [[hidden]];
+
+    $ = NameAbs;
+    u8   NameLen = getStrLen();
+    char FileName[NameLen] [[export]];
+
+    // Parse the referenced ForestFile
     $ = ForestPtr;
     ForestFile File;
-    $ = start;
 
-    u32 ForestZigOffset;
-    $ = start + 4;
+    // restore cursor to the end of this index entry
+    $ = _ret_after_entry;
 };
 
-struct ZifHeader {
-    $ += 16;
-    u32 FileCount;
+struct SiffFile {
+    // File preamble
+    u32 FileSizeMinus4 [[export]];
+    ChunkHeader ForeChunkHeader [[export]]; // first chunk header (expected id 'FORE')
+
+    // FORE chunk payload
+    u32 FileCount [[export]];
+
+    const u32 FileCountCap = 64;
+    u32 SafeFileCount = (FileCount < FileCountCap) ? FileCount : FileCountCap;
+
+    ForestIndex ForestIndexes[SafeFileCount] [[export]];
 };
 
-struct ZifFile {
-    ZifHeader Header;
-    ForestIndex ForestIndexes[Header.FileCount];
-};
-
-ZifFile ZifFileView @ 0x04;
+SiffFile SiffFileView @ 0x00;
